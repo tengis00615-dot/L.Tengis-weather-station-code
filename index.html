@@ -1,0 +1,957 @@
+#include <WiFi.h>
+#include <WebServer.h>
+
+#include <Wire.h>
+#include <Adafruit_BME280.h>
+#include <AS5600.h>
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#include "FS.h"
+#include "SPIFFS.h"
+
+// -------------------- CONFIG --------------------
+#define HALL_PIN 27
+
+// Real-time update interval
+#define UPDATE_MS 1000
+
+// Wind speed calibration (adjust to your anemometer)
+// Example: 1 Hz = 0.666 m/s
+#define WIND_SPEED_FACTOR 0.666
+
+// Wind vane offset calibration (degrees)
+#define WIND_OFFSET 0
+
+// OLED config
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_ADDR 0x3C
+
+// I2C pins (ESP32)
+#define I2C_SDA 21
+#define I2C_SCL 22
+
+// WiFi
+const char* WIFI_SSID = "TP-LINK_45E0";
+const char* WIFI_PASS = "70490954";
+
+// Storage
+static const char* LOG_PATH = "/weather.csv";
+
+// how often to store to SPIFFS (seconds)
+#define LOG_EVERY_SECONDS 5
+
+// rotate when file exceeds this many bytes
+#define LOG_MAX_BYTES (250 * 1024)  // ~250KB
+// ------------------------------------------------
+
+Adafruit_BME280 bme;
+AS5600 as5600;
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+WebServer server(80);
+
+volatile uint32_t pulseCount = 0;
+volatile uint32_t lastPulseMicros = 0;
+
+// latest measurements (served to web)
+float g_windSpeed = 0;
+float g_windDirDeg = 0;
+float g_tempC = 0;
+float g_hum = 0;
+float g_pres = 0;
+uint32_t g_lastDeltaPulses = 0;
+uint32_t g_lastDtMs = 0;
+
+uint32_t lastUpdateMs = 0;
+uint32_t lastPulseCountSnapshot = 0;
+uint32_t lastLogMs = 0;
+
+// ---- WiFi status shown everywhere ----
+String g_ipStr = "0.0.0.0";
+bool   g_wifiOK = false;
+
+// Interrupt function for wind speed
+void IRAM_ATTR countPulse() {
+  uint32_t now = (uint32_t)micros();
+  // Simple debounce (ignore pulses within 5ms)
+  if ((uint32_t)(now - lastPulseMicros) > 5000) {
+    pulseCount++;
+    lastPulseMicros = now;
+  }
+}
+static const char INDEX_HTML[] PROGMEM = R"HTML(
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ESP32 Weather Station</title>
+  <style>
+    :root{
+      --bg0:#070A14;
+      --bg1:#0B1020;
+      --card: rgba(255,255,255,.06);
+      --card2: rgba(255,255,255,.10);
+      --stroke: rgba(255,255,255,.12);
+      --text: rgba(255,255,255,.92);
+      --muted: rgba(255,255,255,.65);
+      --good:#22c55e;
+      --warn:#f59e0b;
+      --bad:#ef4444;
+      --shadow: 0 18px 60px rgba(0,0,0,.55);
+      --r: 18px;
+    }
+
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      color:var(--text);
+      background:
+        radial-gradient(1200px 700px at 20% 10%, #1a2a6c55, transparent 60%),
+        radial-gradient(900px 600px at 80% 40%, #b21f1f33, transparent 55%),
+        radial-gradient(900px 600px at 55% 90%, #00c6ff22, transparent 55%),
+        linear-gradient(180deg, var(--bg1), var(--bg0));
+      min-height:100vh;
+    }
+
+    .wrap{max-width:1200px;margin:0 auto;padding:20px 14px 40px}
+    header{
+      position:sticky; top:0; z-index:10;
+      backdrop-filter: blur(10px);
+      background: linear-gradient(180deg, rgba(7,10,20,.85), rgba(7,10,20,.35));
+      border-bottom:1px solid rgba(255,255,255,.08);
+      padding:14px 0;
+      margin:0 0 16px 0;
+    }
+    .headRow{max-width:1200px;margin:0 auto;padding:0 14px;display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+    .brand{display:flex;align-items:center;gap:12px;min-width:260px}
+    .logo{
+      width:44px;height:44px;border-radius:14px;
+      background: linear-gradient(135deg, #00c6ff66, #0072ff66);
+      border:1px solid rgba(255,255,255,.12);
+      box-shadow: var(--shadow);
+      display:grid;place-items:center;
+    }
+    h1{font-size:16px;margin:0}
+    .sub{color:var(--muted);font-size:12px;margin-top:2px}
+
+    .pill{
+      display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+      padding:10px 12px;border-radius:999px;
+      background: rgba(255,255,255,.06);
+      border:1px solid rgba(255,255,255,.12);
+      box-shadow: 0 10px 30px rgba(0,0,0,.25);
+      font-size:12px;color:var(--muted);
+    }
+    .dot{width:8px;height:8px;border-radius:99px;background:var(--warn);box-shadow:0 0 18px rgba(245,158,11,.45)}
+    .dot.ok{background:var(--good);box-shadow:0 0 18px rgba(34,197,94,.45)}
+    .dot.bad{background:var(--bad);box-shadow:0 0 18px rgba(239,68,68,.45)}
+    .badge{
+      padding:8px 10px;border-radius:999px;
+      background: rgba(0,0,0,.22);
+      border:1px solid rgba(255,255,255,.10);
+      color: var(--muted);
+      white-space:nowrap;
+    }
+    a{color:#9cdcff;text-decoration:none}
+    button, select{
+      background: rgba(0,0,0,.22);
+      border:1px solid rgba(255,255,255,.12);
+      color: rgba(255,255,255,.85);
+      padding:8px 10px;border-radius:12px;
+      cursor:pointer;
+      font: inherit;
+    }
+    button:hover, select:hover{border-color: rgba(255,255,255,.25)}
+    button:active{transform: translateY(1px)}
+    .controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+
+    .grid{display:grid;grid-template-columns: 1.1fr .9fr;gap:14px}
+    @media (max-width:980px){ .grid{grid-template-columns:1fr} }
+
+    .card{
+      background: linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,.06));
+      border:1px solid rgba(255,255,255,.12);
+      border-radius: var(--r);
+      box-shadow: var(--shadow);
+      padding:16px;
+      overflow:hidden;
+    }
+
+    .titleRow{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:10px}
+    .title{font-size:13px;color:var(--muted)}
+    .big{font-size:34px;font-weight:800;letter-spacing:-.8px;line-height:1.1}
+    .unit{font-size:14px;color:var(--muted);font-weight:700;margin-left:6px}
+
+    .kpis{display:grid;grid-template-columns: repeat(4, 1fr);gap:12px;margin-top:12px}
+    @media (max-width:900px){ .kpis{grid-template-columns: repeat(2, 1fr)} }
+    @media (max-width:520px){ .kpis{grid-template-columns:1fr} }
+    .kpi{padding:14px;border-radius:16px;background: rgba(0,0,0,.18);border:1px solid rgba(255,255,255,.10)}
+    .kpi .k{font-size:12px;color:var(--muted)}
+    .kpi .v{font-size:18px;font-weight:800;margin-top:6px}
+    .mini{color:var(--muted);font-size:12px}
+
+    .row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.08)}
+    .row:last-child{border-bottom:none}
+    .label{color:var(--muted);font-size:13px}
+    .value{font-weight:800}
+
+    .two{display:grid;grid-template-columns: 1fr 1fr; gap:14px}
+    @media (max-width:640px){ .two{grid-template-columns:1fr} }
+
+    .canvasWrap{margin-top:12px;display:grid;gap:12px}
+    .chartCard{
+      padding:12px;border-radius:16px;
+      background: rgba(0,0,0,.16);
+      border:1px solid rgba(255,255,255,.10);
+    }
+    canvas{
+      width:100%;
+      height:170px;
+      display:block;
+      background: rgba(0,0,0,.14);
+      border:1px solid rgba(255,255,255,.10);
+      border-radius:14px;
+      touch-action: none;
+    }
+
+    /* compass */
+    .compassWrap{display:flex;align-items:center;gap:14px}
+    .compass{
+      width:120px;height:120px;border-radius:999px;
+      background: rgba(0,0,0,.18);
+      border:1px solid rgba(255,255,255,.12);
+      position:relative;
+      display:grid;place-items:center;
+    }
+    .compass:after{
+      content:"N"; position:absolute; top:6px; left:50%;
+      transform:translateX(-50%);
+      font-size:12px;color:var(--muted);
+    }
+    .needle{
+      width:2px;height:46px;
+      background: linear-gradient(180deg, #ef4444, rgba(239,68,68,.0));
+      transform-origin: 50% 85%;
+      border-radius:4px
+    }
+    .centerDot{width:10px;height:10px;border-radius:99px;background:#fff;opacity:.9;position:absolute}
+
+    .footer{margin-top:14px;color:var(--muted);font-size:12px;display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:space-between}
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="headRow">
+    <div class="brand">
+      <div class="logo" aria-hidden="true">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+          <path d="M7 18a4 4 0 0 1 0-8 5 5 0 0 1 9.7-1.5A4 4 0 1 1 18 18H7Z"
+            stroke="rgba(255,255,255,.9)" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+      <div>
+        <h1>ESP32 Weather Station</h1>
+        <div class="sub">Live sensors + SPIFFS history</div>
+      </div>
+    </div>
+
+    <div class="pill">
+      <span id="dot" class="dot"></span>
+      <span id="status">Connecting…</span>
+      <span class="badge" id="ip">IP: —</span>
+      <span class="badge" id="age">Last: —</span>
+    </div>
+
+    <div class="controls">
+      <select id="range">
+        <option value="120">Last 2 min</option>
+        <option value="300" selected>Last 5 min</option>
+        <option value="600">Last 10 min</option>
+        <option value="1200">Last 20 min</option>
+      </select>
+      <button id="pauseBtn">Pause</button>
+      <a class="badge" href="/download" target="_blank">Download CSV</a>
+      <button class="badge" id="clearBtn">Clear History</button>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="grid">
+    <!-- Left: Wind -->
+    <div class="card">
+      <div class="titleRow">
+        <div class="title">Wind</div>
+        <div class="mini" id="lastUpdate">—</div>
+      </div>
+
+      <div class="big">
+        <span id="wind">--</span><span class="unit">m/s</span>
+      </div>
+
+      <div class="kpis">
+        <div class="kpi"><div class="k">Direction</div><div class="v"><span id="dir">--</span>°</div></div>
+        <div class="kpi"><div class="k">Direction (text)</div><div class="v" id="dirText">—</div></div>
+        <div class="kpi"><div class="k">Pulses (last)</div><div class="v"><span id="pulses">--</span></div></div>
+        <div class="kpi"><div class="k">Interval</div><div class="v"><span id="dt">--</span> ms</div></div>
+      </div>
+
+      <div class="two" style="margin-top:12px">
+        <div class="chartCard">
+          <div class="titleRow" style="margin-bottom:8px">
+            <div class="title">Compass</div>
+            <div class="mini">Current wind vane</div>
+          </div>
+          <div class="compassWrap">
+            <div class="compass">
+              <div class="needle" id="needle"></div>
+              <div class="centerDot"></div>
+            </div>
+            <div>
+              <div class="mini">Tip: choose a range to reload history</div>
+              <div class="mini">Charts auto-scale + show min/max/avg</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="chartCard">
+          <div class="titleRow" style="margin-bottom:8px">
+            <div class="title">Wind speed trend</div>
+            <div class="mini" id="windStats">—</div>
+          </div>
+          <canvas id="cWind" width="900" height="260"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right: Atmosphere -->
+    <div class="card">
+      <div class="titleRow">
+        <div class="title">Atmosphere</div>
+        <div class="mini badge">Pressure is station pressure</div>
+      </div>
+
+      <div class="row"><div class="label">Temperature</div><div class="value"><span id="temp">--</span> °C</div></div>
+      <div class="row"><div class="label">Humidity</div><div class="value"><span id="hum">--</span> %</div></div>
+      <div class="row"><div class="label">Pressure</div><div class="value"><span id="pres">--</span> hPa</div></div>
+
+      <div class="canvasWrap">
+        <div class="chartCard">
+          <div class="titleRow" style="margin-bottom:8px">
+            <div class="title">Temperature</div>
+            <div class="mini" id="tempStats">—</div>
+          </div>
+          <canvas id="cTemp" width="900" height="260"></canvas>
+        </div>
+
+        <div class="chartCard">
+          <div class="titleRow" style="margin-bottom:8px">
+            <div class="title">Humidity</div>
+            <div class="mini" id="humStats">—</div>
+          </div>
+          <canvas id="cHum" width="900" height="260"></canvas>
+        </div>
+
+        <div class="chartCard">
+          <div class="titleRow" style="margin-bottom:8px">
+            <div class="title">Pressure</div>
+            <div class="mini" id="presStats">—</div>
+          </div>
+          <canvas id="cPres" width="900" height="260"></canvas>
+        </div>
+      </div>
+
+      <div class="footer">
+        <div class="badge">Uptime: <span id="up">--</span>s</div>
+        <div class="badge">Wi-Fi RSSI: <span id="rssi">--</span> dBm</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const $ = (id)=>document.getElementById(id);
+
+  // store history as objects: {t, wind, dir, temp, hum, pres}
+  const series = [];
+  let maxPoints = 300;
+  let paused = false;
+  let lastGoodMs = 0;
+
+  function dirToText(deg){
+    const dirs = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
+    const i = Math.round(((deg % 360) / 22.5)) % 16;
+    return dirs[i] + " (" + Math.round(deg) + "°)";
+  }
+
+  function calcStats(arr){
+    if(!arr.length) return null;
+    let min=arr[0], max=arr[0], sum=0;
+    for(const v of arr){ if(v<min) min=v; if(v>max) max=v; sum+=v; }
+    return {min, max, avg: sum/arr.length};
+  }
+
+  // simple smoothing (moving average)
+  function smooth(values, win=3){
+    if(values.length < 3 || win <= 1) return values.slice();
+    const out = new Array(values.length);
+    const half = Math.floor(win/2);
+    for(let i=0;i<values.length;i++){
+      let s=0, c=0;
+      for(let k=i-half;k<=i+half;k++){
+        if(k>=0 && k<values.length){ s += values[k]; c++; }
+      }
+      out[i] = s / c;
+    }
+    return out;
+  }
+
+  function drawChart(canvasId, values, unitLabel, statsId){
+    const c = $(canvasId);
+    const ctx = c.getContext("2d");
+    const w = c.width, h = c.height;
+
+    ctx.clearRect(0,0,w,h);
+
+    if(values.length < 2){
+      ctx.globalAlpha = 0.7;
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "14px system-ui";
+      ctx.fillText("No data yet", 14, 24);
+      ctx.globalAlpha = 1;
+      return;
+    }
+
+    // chart area
+    const padL = 44, padR = 12, padT = 10, padB = 26;
+    const cw = w - padL - padR;
+    const ch = h - padT - padB;
+
+    const minV = Math.min(...values);
+    const maxV = Math.max(...values);
+    const span = (maxV - minV) || 1;
+    const lo = minV - span*0.10;
+    const hi = maxV + span*0.10;
+
+    function x(i){ return padL + (cw * (i/(values.length-1))); }
+    function y(v){ return padT + ch - ( (v-lo)/(hi-lo) ) * ch; }
+
+    // grid
+    ctx.lineWidth = 1;
+    ctx.globalAlpha = 0.20;
+    ctx.strokeStyle = "#ffffff";
+    for(let i=0;i<=4;i++){
+      const yy = padT + (ch/4)*i;
+      ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(padL+cw, yy); ctx.stroke();
+    }
+    for(let i=0;i<=6;i++){
+      const xx = padL + (cw/6)*i;
+      ctx.beginPath(); ctx.moveTo(xx, padT); ctx.lineTo(xx, padT+ch); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // y labels
+    ctx.fillStyle = "rgba(255,255,255,.75)";
+    ctx.font = "12px system-ui";
+    for(let i=0;i<=4;i++){
+      const v = hi - ( (hi-lo)/4 )*i;
+      const yy = padT + (ch/4)*i;
+      ctx.fillText(v.toFixed(1), 8, yy+4);
+    }
+    ctx.fillText(unitLabel, 8, padT+ch+18);
+
+    // line
+    const sm = smooth(values, 3);
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = "rgba(156,220,255,.95)";
+    ctx.beginPath();
+    for(let i=0;i<sm.length;i++){
+      const xx = x(i);
+      const yy = y(sm[i]);
+      if(i===0) ctx.moveTo(xx,yy);
+      else ctx.lineTo(xx,yy);
+    }
+    ctx.stroke();
+
+    // last point marker
+    const lx = x(sm.length-1), ly = y(sm[sm.length-1]);
+    ctx.fillStyle = "rgba(34,197,94,.95)";
+    ctx.beginPath(); ctx.arc(lx, ly, 4, 0, Math.PI*2); ctx.fill();
+
+    // stats text
+    const st = calcStats(values);
+    if(st && statsId){
+      $(statsId).textContent = `min ${st.min.toFixed(1)} • avg ${st.avg.toFixed(1)} • max ${st.max.toFixed(1)}`;
+    }
+  }
+
+  function redrawAll(){
+    const winds = series.map(r=>r.wind);
+    const temps = series.map(r=>r.temp);
+    const hums  = series.map(r=>r.hum);
+    const press = series.map(r=>r.pres);
+
+    drawChart("cWind", winds, "m/s", "windStats");
+    drawChart("cTemp", temps, "°C",  "tempStats");
+    drawChart("cHum",  hums,  "%",   "humStats");
+    drawChart("cPres", press, "hPa", "presStats");
+  }
+
+  async function loadHistory(n){
+    maxPoints = n;
+    series.length = 0;
+
+    try{
+      const res = await fetch("/history?n=" + n, {cache:"no-store"});
+      const arr = await res.json();
+
+      for(const r of arr){
+        // r.t is millis() from ESP32, keep it anyway; charts use value series.
+        series.push({
+          t: Number(r.t||0),
+          wind: Number(r.wind||0),
+          dir: Number(r.dir||0),
+          temp: Number(r.temp||0),
+          hum: Number(r.hum||0),
+          pres: Number(r.pres||0),
+        });
+      }
+
+      // keep last maxPoints
+      while(series.length > maxPoints) series.shift();
+
+      redrawAll();
+    }catch(e){
+      // ignore
+    }
+  }
+
+  function setStatus(ok, text){
+    $("status").textContent = text;
+    const dot = $("dot");
+    dot.classList.remove("ok","bad");
+    if(ok === true) dot.classList.add("ok");
+    else if(ok === false) dot.classList.add("bad");
+  }
+
+  async function tick(){
+    if(paused) return;
+
+    try{
+      const res = await fetch("/api", {cache:"no-store"});
+      const d = await res.json();
+
+      $("wind").textContent = Number(d.wind_ms).toFixed(1);
+      $("dir").textContent  = Math.round(Number(d.dir_deg));
+      $("temp").textContent = Number(d.temp_c).toFixed(1);
+      $("hum").textContent  = Number(d.hum_pct).toFixed(1);
+      $("pres").textContent = Number(d.pres_hpa).toFixed(1);
+
+      $("pulses").textContent = d.delta_pulses;
+      $("dt").textContent     = d.dt_ms;
+      $("up").textContent     = d.uptime_s;
+      $("rssi").textContent   = d.rssi_dbm;
+
+      $("ip").textContent = "IP: " + d.ip;
+      $("lastUpdate").textContent = "Updated: " + new Date().toLocaleTimeString();
+
+      $("dirText").textContent = dirToText(Number(d.dir_deg));
+      $("needle").style.transform = "rotate(" + Number(d.dir_deg) + "deg)";
+
+      lastGoodMs = Date.now();
+      $("age").textContent = "Last: 0s";
+      setStatus(true, d.wifi_ok ? "Live (Wi-Fi)" : "Live (AP)");
+
+      // push new live point
+      series.push({
+        t: Date.now(),
+        wind: Number(d.wind_ms),
+        dir: Number(d.dir_deg),
+        temp: Number(d.temp_c),
+        hum:  Number(d.hum_pct),
+        pres: Number(d.pres_hpa),
+      });
+      while(series.length > maxPoints) series.shift();
+
+      redrawAll();
+    }catch(e){
+      setStatus(false, "Offline");
+    }
+  }
+
+  function tickAge(){
+    if(!lastGoodMs){
+      $("age").textContent = "Last: —";
+      return;
+    }
+    const s = Math.floor((Date.now()-lastGoodMs)/1000);
+    $("age").textContent = "Last: " + s + "s";
+    if(s >= 5) setStatus(false, "Stale data");
+  }
+
+  $("clearBtn").addEventListener("click", async ()=>{
+    if(!confirm("Clear all stored history?")) return;
+    await fetch("/clear", {cache:"no-store"});
+    await loadHistory(maxPoints);
+  });
+
+  $("pauseBtn").addEventListener("click", ()=>{
+    paused = !paused;
+    $("pauseBtn").textContent = paused ? "Resume" : "Pause";
+    setStatus(paused ? null : true, paused ? "Paused" : $("status").textContent);
+  });
+
+  $("range").addEventListener("change", async (e)=>{
+    const n = Number(e.target.value);
+    await loadHistory(n);
+  });
+
+  // boot
+  (async ()=>{
+    const n = Number($("range").value);
+    await loadHistory(n);
+    await tick();
+    setInterval(tick, 1000);
+    setInterval(tickAge, 500);
+  })();
+</script>
+</body>
+</html>
+)HTML";
+// -------------------- SPIFFS helpers --------------------
+
+void ensureLogHeader() {
+  if (!SPIFFS.exists(LOG_PATH)) {
+    File f = SPIFFS.open(LOG_PATH, FILE_WRITE);
+    if (f) {
+      f.println("t_ms,wind_ms,dir_deg,temp_c,hum_pct,pres_hpa,delta_pulses,dt_ms");
+      f.close();
+    }
+  }
+}
+
+size_t logSize() {
+  File f = SPIFFS.open(LOG_PATH, FILE_READ);
+  if (!f) return 0;
+  size_t s = f.size();
+  f.close();
+  return s;
+}
+
+void rotateIfNeeded() {
+  size_t s = logSize();
+  if (s < LOG_MAX_BYTES) return;
+
+  if (SPIFFS.exists("/weather_old.csv")) SPIFFS.remove("/weather_old.csv");
+  SPIFFS.rename(LOG_PATH, "/weather_old.csv");
+  ensureLogHeader();
+}
+
+void appendLogRow() {
+  rotateIfNeeded();
+  File f = SPIFFS.open(LOG_PATH, FILE_APPEND);
+  if (!f) return;
+
+  f.print(millis());
+  f.print(",");
+  f.print(g_windSpeed, 3);
+  f.print(",");
+  f.print(g_windDirDeg, 2);
+  f.print(",");
+  f.print(g_tempC, 2);
+  f.print(",");
+  f.print(g_hum, 2);
+  f.print(",");
+  f.print(g_pres, 2);
+  f.print(",");
+  f.print(g_lastDeltaPulses);
+  f.print(",");
+  f.println(g_lastDtMs);
+
+  f.close();
+}
+
+// Return last N lines as JSON array
+String getLastNAsJson(int n) {
+  if (n < 1) n = 1;
+  if (n > 2000) n = 2000;
+
+  File f = SPIFFS.open(LOG_PATH, FILE_READ);
+  if (!f) return "[]";
+
+  String content;
+  content.reserve((size_t)f.size() + 16);
+  while (f.available()) content += char(f.read());
+  f.close();
+
+  int linesCount = 0;
+  for (int i = 0; i < content.length(); i++) if (content[i] == '\n') linesCount++;
+
+  int startLine = linesCount - n;
+  if (startLine < 1) startLine = 1; // skip header
+
+  String out = "[";
+  int currentLine = 0;
+  int start = 0;
+
+  for (int i = 0; i <= content.length(); i++) {
+    if (i == content.length() || content[i] == '\n') {
+      String line = content.substring(start, i);
+      start = i + 1;
+
+      if (currentLine >= startLine && line.length() > 0 && line.indexOf("t_ms") != 0) {
+        float wind=0, dir=0, temp=0, hum=0, pres=0;
+        uint32_t t=0, delta=0, dt=0;
+
+        int p1=0, p2=line.indexOf(',');
+        if(p2>0) t = (uint32_t) line.substring(p1,p2).toInt();
+
+        p1=p2+1; p2=line.indexOf(',',p1); if(p2>p1) wind = line.substring(p1,p2).toFloat();
+        p1=p2+1; p2=line.indexOf(',',p1); if(p2>p1) dir  = line.substring(p1,p2).toFloat();
+        p1=p2+1; p2=line.indexOf(',',p1); if(p2>p1) temp = line.substring(p1,p2).toFloat();
+        p1=p2+1; p2=line.indexOf(',',p1); if(p2>p1) hum  = line.substring(p1,p2).toFloat();
+        p1=p2+1; p2=line.indexOf(',',p1); if(p2>p1) pres = line.substring(p1,p2).toFloat();
+        p1=p2+1; p2=line.indexOf(',',p1); if(p2>p1) delta= (uint32_t) line.substring(p1,p2).toInt();
+        p1=p2+1;               if(p1<(int)line.length()) dt = (uint32_t) line.substring(p1).toInt();
+
+        if (out.length() > 1) out += ",";
+        out += "{\"t\":" + String(t);
+        out += ",\"wind\":" + String(wind,3);
+        out += ",\"dir\":" + String(dir,2);
+        out += ",\"temp\":" + String(temp,2);
+        out += ",\"hum\":" + String(hum,2);
+        out += ",\"pres\":" + String(pres,2);
+        out += ",\"delta\":" + String(delta);
+        out += ",\"dt\":" + String(dt);
+        out += "}";
+      }
+
+      currentLine++;
+    }
+  }
+
+  out += "]";
+  return out;
+}
+
+// -------------------- Web handlers --------------------
+
+void handleRoot() { server.send(200, "text/html; charset=utf-8", INDEX_HTML); }
+
+void handleAPI() {
+  String json = "{";
+  json += "\"wind_ms\":" + String(g_windSpeed, 3) + ",";
+  json += "\"dir_deg\":" + String(g_windDirDeg, 2) + ",";
+  json += "\"temp_c\":" + String(g_tempC, 2) + ",";
+  json += "\"hum_pct\":" + String(g_hum, 2) + ",";
+  json += "\"pres_hpa\":" + String(g_pres, 2) + ",";
+  json += "\"delta_pulses\":" + String(g_lastDeltaPulses) + ",";
+  json += "\"dt_ms\":" + String(g_lastDtMs) + ",";
+  json += "\"uptime_s\":" + String(millis() / 1000) + ",";
+  json += "\"rssi_dbm\":" + String(WiFi.RSSI()) + ",";
+  json += "\"ip\":\"" + g_ipStr + "\",";
+  json += "\"wifi_ok\":" + String(g_wifiOK ? 1 : 0);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleHistory() {
+  int n = 300;
+  if (server.hasArg("n")) n = server.arg("n").toInt();
+  String out = getLastNAsJson(n);
+  server.send(200, "application/json", out);
+}
+
+void handleDownload() {
+  if (!SPIFFS.exists(LOG_PATH)) {
+    server.send(404, "text/plain", "No log yet");
+    return;
+  }
+  File f = SPIFFS.open(LOG_PATH, FILE_READ);
+  server.streamFile(f, "text/csv");
+  f.close();
+}
+
+void handleClear() {
+  if (SPIFFS.exists(LOG_PATH)) SPIFFS.remove(LOG_PATH);
+  ensureLogHeader();
+  server.send(200, "text/plain", "OK");
+}
+
+// ---- Fixed WiFi: shows IP always, AP fallback ----
+void wifiConnect() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
+
+  Serial.println();
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < 30000) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    g_wifiOK = true;
+    g_ipStr = WiFi.localIP().toString();
+    Serial.println("✅ WiFi Connected!");
+    Serial.print("IP: ");
+    Serial.println(g_ipStr);
+    return;
+  }
+
+  // AP fallback
+  Serial.println("❌ WiFi FAILED. Starting AP: WeatherStation (pass 12345678)");
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP("WeatherStation", "12345678");
+  g_wifiOK = false;
+  g_ipStr = WiFi.softAPIP().toString();
+  Serial.print("✅ AP IP: ");
+  Serial.println(g_ipStr);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(600);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  // OLED init
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("OLED not found!");
+  } else {
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(10, 20);
+    display.println("Weather");
+    display.display();
+    delay(1200);
+  }
+
+  if (!bme.begin(0x76)) { // Try 0x77 if needed
+    Serial.println("BME280 not found!");
+  }
+
+  if (!as5600.begin()) {
+    Serial.println("AS5600 not detected!");
+  }
+
+  pinMode(HALL_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(HALL_PIN), countPulse, FALLING);
+
+  lastUpdateMs = millis();
+  lastPulseCountSnapshot = pulseCount;
+  lastLogMs = millis();
+
+  // SPIFFS
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS mount failed!");
+  } else {
+    ensureLogHeader();
+    Serial.print("SPIFFS OK. Log size: ");
+    Serial.println(logSize());
+  }
+
+  // WiFi + Web
+  wifiConnect();
+
+  server.on("/", handleRoot);
+  server.on("/api", handleAPI);
+  server.on("/history", handleHistory);
+  server.on("/download", handleDownload);
+  server.on("/clear", handleClear);
+
+  server.begin();
+  Serial.println("✅ Web server started.");
+  Serial.print("Open: http://");
+  Serial.print(g_ipStr);
+  Serial.println("/");
+  if (!g_wifiOK) {
+    Serial.println("AP mode: connect to WiFi 'WeatherStation' pass '12345678'");
+  }
+}
+
+void loop() {
+  server.handleClient();
+
+  uint32_t nowMs = millis();
+
+  // Update readings every UPDATE_MS
+  if ((uint32_t)(nowMs - lastUpdateMs) >= UPDATE_MS) {
+    uint32_t dtMs = (uint32_t)(nowMs - lastUpdateMs);
+    lastUpdateMs = nowMs;
+
+    // --- Wind speed from pulses in last interval ---
+    uint32_t currentPulses = pulseCount; // 32-bit atomic ok on ESP32
+    uint32_t deltaPulses = currentPulses - lastPulseCountSnapshot;
+    lastPulseCountSnapshot = currentPulses;
+
+    float dtSec = dtMs / 1000.0f;
+    float frequency = (dtSec > 0) ? (deltaPulses / dtSec) : 0.0f; // Hz
+    float windSpeed = frequency * WIND_SPEED_FACTOR;              // m/s
+
+    // --- Wind direction ---
+    uint16_t rawAngle = as5600.readAngle();
+    float angleDeg = (rawAngle * 360.0f) / 4096.0f;
+    angleDeg += WIND_OFFSET;
+    if (angleDeg >= 360) angleDeg -= 360;
+    if (angleDeg < 0) angleDeg += 360;
+
+    // --- BME280 ---
+    float temperature = bme.readTemperature();
+    float humidity = bme.readHumidity();
+    float pressure = bme.readPressure() / 100.0f; // hPa
+
+    // store for API
+    g_windSpeed = windSpeed;
+    g_windDirDeg = angleDeg;
+    g_tempC = temperature;
+    g_hum = humidity;
+    g_pres = pressure;
+    g_lastDeltaPulses = deltaPulses;
+    g_lastDtMs = dtMs;
+
+    // --- Serial output ---
+    Serial.print("Wind "); Serial.print(windSpeed, 2); Serial.print(" m/s, ");
+    Serial.print("Dir ");  Serial.print(angleDeg, 0);  Serial.print(" deg, ");
+    Serial.print("T ");    Serial.print(temperature, 1); Serial.print(" C, ");
+    Serial.print("H ");    Serial.print(humidity, 1);    Serial.print(" %, ");
+    Serial.print("P ");    Serial.print(pressure, 1);    Serial.print(" hPa, ");
+    Serial.print("IP ");   Serial.println(g_ipStr);
+
+    // --- OLED (shows IP always) ---
+    if (display.width() > 0) {
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(0, 0);
+
+      display.print("Wind: "); display.print(windSpeed, 1); display.println(" m/s");
+      display.print("Dir : "); display.print(angleDeg, 0);  display.println(" deg");
+      display.print("Temp: "); display.print(temperature, 1); display.println(" C");
+      display.print("Hum : "); display.print(humidity, 1);    display.println(" %");
+      display.print("Pres: "); display.print(pressure, 1);    display.println(" hPa");
+      display.print("IP  : "); display.println(g_ipStr);
+
+      display.display();
+    }
+  }
+
+  // Log to SPIFFS every LOG_EVERY_SECONDS
+  if ((uint32_t)(nowMs - lastLogMs) >= (LOG_EVERY_SECONDS * 1000UL)) {
+    lastLogMs = nowMs;
+    appendLogRow();
+  }
+}
